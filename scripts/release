@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Cut a semver release: bump manifest.json, date the Unreleased section of
+# CHANGELOG.md, commit, and tag vX.Y.Z. manifest.json is the only place the
+# version lives; the Omarchy plugin list reads it from there.
+#
+#   scripts/release patch|minor|major|X.Y.Z
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+die() { echo "release: $*" >&2; exit 1; }
+
+bump=${1:-}
+[[ -n $bump ]] || die "usage: scripts/release patch|minor|major|X.Y.Z"
+[[ -z $(git status --porcelain) ]] || die "working tree is dirty; commit first"
+
+current=$(jq -r .version manifest.json)
+[[ $current =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || die "manifest version '$current' isn't X.Y.Z"
+major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+
+case $bump in
+  major) next="$((major + 1)).0.0" ;;
+  minor) next="$major.$((minor + 1)).0" ;;
+  patch) next="$major.$minor.$((patch + 1))" ;;
+  [0-9]*.[0-9]*.[0-9]*) next=$bump ;;
+  *) die "unknown bump '$bump'" ;;
+esac
+
+git rev-parse -q --verify "refs/tags/v$next" >/dev/null && die "tag v$next already exists"
+
+# Unreleased must have at least one entry, or there's nothing to release.
+notes=$(awk '/^## Unreleased/ { on = 1; next } /^## / { on = 0 } on && NF' CHANGELOG.md)
+[[ -n $notes ]] || die "CHANGELOG.md has nothing under ## Unreleased"
+
+tmp=$(mktemp)
+jq --arg v "$next" '.version = $v' manifest.json >"$tmp" && mv "$tmp" manifest.json
+awk -v v="$next" -v d="$(date +%F)" '
+  /^## Unreleased/ { print; print ""; print "## " v " — " d; next } { print }
+' CHANGELOG.md >"$tmp" && mv "$tmp" CHANGELOG.md
+
+git commit -qam "Release v$next"
+git tag -a "v$next" -m "v$next"$'\n\n'"$notes"
+echo "Released v$next (was v$current). Push with: git push --follow-tags"

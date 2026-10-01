@@ -1,0 +1,811 @@
+#!/bin/bash
+
+# omarchy:summary=Convert an EPUB into an M4B audiobook on the GPU and import it into Audiobookshelf
+# omarchy:args=<convert <file.epub>...|status|epubs|cancel <id>|open <id>|log <id>|clear|doctor [--fix]|server [info|up|down|password|copy-password]|engine pull|version>
+
+# Runs ebook2audiobook headlessly from its published Docker image, one
+# throwaway container per book, one book at a time so the GPU is never shared.
+# Nothing has to be set up first: the right image (CUDA or CPU) is pulled on
+# first use, and models are cached under ~/.local/share/omarchy-audiobook.
+# The plugin also runs its own Audiobookshelf server in the background (a
+# restart=unless-stopped container, listening on localhost only), creating
+# its admin account, library and API key itself.
+# Each job runs in its own transient systemd user unit, so closing the
+# terminal (or clicking in the bar) doesn't kill a conversion that takes
+# hours. Job state lives as one JSON file per job, which the bar widget polls.
+
+set -euo pipefail
+
+SELF=$(realpath "$0")
+PLUGIN_DIR=$(dirname "$(dirname "$SELF")")
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-audiobook/config"
+# Generated Audiobookshelf credentials, kept apart from hand-edited config.
+CREDENTIALS_FILE="$(dirname "$CONFIG_FILE")/abs.env"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-audiobook"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-audiobook"
+JOBS_DIR="$STATE_DIR/jobs"
+ENGINE_FILE="$STATE_DIR/engine.json"
+GLYPH="󰋋"
+
+# Defaults. Override any of these in $CONFIG_FILE (plain bash).
+E2A_REPO=athomasson2/ebook2audiobook
+E2A_VERSION=v26.9.27 # pinned per plugin release; bump both together
+E2A_VARIANT=auto     # auto | cu130 | cpu
+E2A_LANGUAGE=eng
+E2A_EXTRA_ARGS=()
+E2A_MODELS_DIR="$DATA_DIR/models"
+ABS_MANAGED=true # false: use an Audiobookshelf you run yourself (set ABS_URL, ABS_CONTAINER, run setup)
+ABS_IMAGE=ghcr.io/advplyr/audiobookshelf:2.37.1
+ABS_PORT=13378
+ABS_LIBRARY_DIR="$HOME/Audiobooks"
+ABS_URL=
+ABS_TOKEN=
+ABS_USERNAME=
+ABS_PASSWORD=
+ABS_CONTAINER=omarchy-audiobook-abs
+ABS_LIBRARY_ID=
+OUTPUT_DIR= # where books go if Audiobookshelf can't be reached; defaults to the library
+EPUB_DIRS=("$HOME/Downloads" "$HOME/Documents" "$HOME/Books" "$HOME/Archive/Books" "$HOME/Archive/Calibre")
+
+[[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
+[[ -f $CREDENTIALS_FILE ]] && source "$CREDENTIALS_FILE"
+ABS_URL=${ABS_URL:-http://localhost:$ABS_PORT}
+OUTPUT_DIR=${OUTPUT_DIR:-$ABS_LIBRARY_DIR}
+mkdir -p "$JOBS_DIR" "$DATA_DIR/work"
+
+die() { echo "omarchy-audiobook: $*" >&2; exit 1; }
+
+notify() {
+  command -v omarchy-notification-send >/dev/null || return 0
+  omarchy-notification-send -g "$GLYPH" "$@" 2>/dev/null || true
+}
+
+# ---- job state -------------------------------------------------------------
+
+job_file() { echo "$JOBS_DIR/$1.json"; }
+
+# job_update <id> <jq filter> [jq args...] — atomic rewrite of the job file.
+job_update() {
+  local file tmp
+  file=$(job_file "$1")
+  tmp=$(mktemp "$file.XXXXXX")
+  if jq "${@:3}" "$2" "$file" >"$tmp"; then mv -f "$tmp" "$file"; else rm -f "$tmp"; fi
+}
+
+job_get() { jq -r "$2 // empty" "$(job_file "$1")"; }
+
+# ---- engine: the ebook2audiobook image -------------------------------------------
+
+# cu130 needs an NVIDIA driver new enough for CUDA 13 (580+). Read the version
+# from /proc rather than running nvidia-smi, since the widget asks every poll.
+nvidia_driver_major() {
+  [[ -r /proc/driver/nvidia/version ]] || return 1
+  grep -oE '[0-9]{3,}\.[0-9]+' /proc/driver/nvidia/version | head -n1 | cut -d. -f1
+}
+
+engine_variant() {
+  if [[ $E2A_VARIANT != auto ]]; then echo "$E2A_VARIANT"; return; fi
+  local major
+  if major=$(nvidia_driver_major) && ((major >= 580)); then echo cu130; else echo cpu; fi
+}
+
+engine_image() { echo "$E2A_REPO:$E2A_VERSION-$(engine_variant)"; }
+
+engine_device() { [[ $(engine_variant) == cpu ]] && echo cpu || echo cuda; }
+
+docker_socket() {
+  local host=${DOCKER_HOST:-unix:///var/run/docker.sock}
+  [[ $host == unix://* ]] && echo "${host#unix://}"
+}
+
+# What stops a conversion from running, as a short machine-readable reason.
+# Only cheap checks — no subprocesses beyond `command -v` — so the widget can
+# ask on every poll.
+docker_problem() {
+  local sock
+  command -v docker >/dev/null || { echo docker-missing; return; }
+  sock=$(docker_socket)
+  if [[ -n $sock ]]; then
+    [[ -S $sock ]] || { echo docker-stopped; return; }
+    [[ -r $sock && -w $sock ]] || { echo docker-permission; return; }
+  fi
+}
+
+engine_problem() {
+  local problem
+  problem=$(docker_problem)
+  [[ -z $problem ]] || { echo "$problem"; return; }
+  if [[ $(engine_variant) != cpu ]] && ! command -v nvidia-ctk >/dev/null; then
+    echo gpu-runtime-missing
+    return
+  fi
+}
+
+engine_present() { docker image inspect "$(engine_image)" >/dev/null 2>&1; }
+
+engine_state_set() { # <jq filter> [jq args...]
+  local tmp
+  [[ -f $ENGINE_FILE ]] || echo '{}' >"$ENGINE_FILE"
+  tmp=$(mktemp "$ENGINE_FILE.XXXXXX")
+  if jq "${@:2}" "$1" "$ENGINE_FILE" >"$tmp"; then mv -f "$tmp" "$ENGINE_FILE"; else rm -f "$tmp"; fi
+}
+
+# Pull through the Docker Engine API instead of `docker pull`, because the API
+# streams per-layer byte counts we can turn into a real progress bar. Each
+# progress update calls the optional callback with <done bytes> <total bytes>.
+engine_pull() { # [progress callback]
+  local image repo tag total sock
+  image=$(engine_image)
+  repo=${image%:*} tag=${image##*:}
+  total=$(curl -sf -m 10 "https://hub.docker.com/v2/repositories/$repo/tags/$tag" | jq -r '.full_size // 0') || total=0
+  sock=$(docker_socket)
+
+  engine_state_set '.pulling = {image: $i, done: 0, total: ($t | tonumber), started: now}' --arg i "$image" --arg t "$total"
+  if [[ -z $sock ]]; then
+    docker pull -q "$image" >/dev/null # remote DOCKER_HOST: no socket to stream from
+  else
+    local err
+    err=$(curl -sfN --unix-socket "$sock" -X POST "http://localhost/images/create?fromImage=$repo&tag=$tag" |
+      jq --unbuffered -r 'if .error then "error\t\(.error)"
+        else ["layer", (.id // ""), (.status // ""), (.progressDetail.current // 0), (.progressDetail.total // 0)] | @tsv end' |
+      gawk -F'\t' -v total="$total" '
+        $1 == "error" { print "error\t" $2; fflush(); exit 1 }
+        $2 == "" { next }
+        {
+          id = $2
+          if ($5 > 0 && $3 == "Downloading") { size[id] = $5; cur[id] = $4 }
+          if ($3 == "Download complete" || $3 == "Pull complete" || $3 == "Already exists") cur[id] = size[id]
+          done = 0; seen = 0
+          for (l in cur) done += cur[l]
+          for (l in size) seen += size[l]
+          t = (total > seen) ? total : seen
+          # Only report when the whole percent moves.
+          pct = t > 0 ? int(done * 100 / t) : 0
+          if (pct != last) { last = pct; print "progress\t" done "\t" t; fflush() }
+        }' |
+      while IFS=$'\t' read -r kind a b; do
+        case $kind in
+          error) echo "$a" ;;
+          progress)
+            engine_state_set '.pulling.done = ($d | tonumber) | .pulling.total = ($t | tonumber)' --arg d "$a" --arg t "$b"
+            [[ -n ${1:-} ]] && "$1" "$a" "$b"
+            ;;
+        esac
+      done)
+    [[ -z $err ]] || { engine_state_set 'del(.pulling)'; die "pulling $image failed: $err"; }
+  fi
+  engine_state_set 'del(.pulling)'
+  engine_present || die "pulled $image but docker can't find it"
+
+  # Drop images this plugin pulled for older releases; they're 3-6 GB each.
+  local old
+  for old in $(jq -r --arg i "$image" '(.pulled // [])[] | select(. != $i)' "$ENGINE_FILE"); do
+    docker image rm "$old" >/dev/null 2>&1 || true
+  done
+  engine_state_set '.pulled = [$i]' --arg i "$image"
+}
+
+# Make sure the image is here before a job starts, pulling it (once, under a
+# lock) if not. Prints a reason and fails when something needs the user.
+ensure_engine() { # [progress callback]
+  local problem
+  problem=$(engine_problem)
+  [[ -z $problem ]] || { echo "$problem"; return 1; }
+  exec 8>"$STATE_DIR/engine.lock"
+  flock 8
+  engine_present || engine_pull "${1:-}"
+  exec 8>&-
+}
+
+# Reuse a models cache from an earlier ebook2audiobook checkout so the ~2 GB
+# XTTS download doesn't happen twice.
+ensure_models_dir() {
+  [[ -e $E2A_MODELS_DIR ]] && return
+  local legacy
+  for legacy in "$HOME/ebook2audiobook/models"; do
+    if [[ -d $legacy && -n $(ls -A "$legacy" 2>/dev/null) ]]; then
+      mkdir -p "$(dirname "$E2A_MODELS_DIR")"
+      ln -s "$legacy" "$E2A_MODELS_DIR"
+      return
+    fi
+  done
+  mkdir -p "$E2A_MODELS_DIR"
+}
+
+problem_message() {
+  case $1 in
+    docker-missing) echo "Docker isn't installed" ;;
+    docker-stopped) echo "Docker isn't running" ;;
+    docker-permission) echo "You aren't in the docker group yet" ;;
+    gpu-runtime-missing) echo "Docker can't reach the NVIDIA GPU yet" ;;
+    "") echo "Couldn't download ebook2audiobook" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# ---- audiobookshelf ------------------------------------------------------------
+
+# Host path bind-mounted at <dest> inside <container>.
+container_mount() {
+  docker inspect "$1" --format "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null
+}
+
+abs_running() {
+  curl -sf -m 3 "$ABS_URL/status" | jq -e '.app == "audiobookshelf"' >/dev/null 2>&1
+}
+
+abs_api() { # <method> <path> [curl args...]
+  curl -sf -m "${ABS_TIMEOUT:-15}" -X "$1" -H "Authorization: Bearer $ABS_TOKEN" "${@:3}" "$ABS_URL$2"
+}
+
+# Persist one generated credential in $CREDENTIALS_FILE (mode 600).
+save_credential() { # <NAME> <value>
+  local tmp
+  mkdir -p "$(dirname "$CREDENTIALS_FILE")"
+  touch "$CREDENTIALS_FILE"
+  chmod 600 "$CREDENTIALS_FILE"
+  tmp=$(mktemp "$CREDENTIALS_FILE.XXXXXX")
+  grep -v "^$1=" "$CREDENTIALS_FILE" >"$tmp" || true
+  printf '%s=%q\n' "$1" "$2" >>"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$CREDENTIALS_FILE"
+  printf -v "$1" '%s' "$2"
+}
+
+# Start (creating or upgrading if needed) the plugin's Audiobookshelf
+# container, wait for it to answer, and make sure it's set up. It listens on
+# localhost only; reaching it from other devices is left to the user (see
+# README: Tailscale Serve).
+abs_up() {
+  $ABS_MANAGED || return 0
+  local problem state image
+  problem=$(docker_problem)
+  [[ -z $problem ]] || die "$(problem_message "$problem")"
+
+  state=$(docker inspect -f '{{.State.Status}}' "$ABS_CONTAINER" 2>/dev/null) || state=""
+  image=$(docker inspect -f '{{.Config.Image}}' "$ABS_CONTAINER" 2>/dev/null) || image=""
+  # A plugin release that moves ABS_IMAGE replaces the container; the data
+  # lives in bind mounts, so nothing is lost.
+  if [[ -n $state && $image != "$ABS_IMAGE" ]]; then
+    docker rm -f "$ABS_CONTAINER" >/dev/null
+    state=""
+  fi
+
+  if [[ -z $state ]]; then
+    if [[ -n $(ss -ltnH "sport = :$ABS_PORT" 2>/dev/null) ]]; then
+      die "port $ABS_PORT is taken by another program; stop it or set ABS_PORT in $CONFIG_FILE"
+    fi
+    mkdir -p "$DATA_DIR/abs/config" "$DATA_DIR/abs/metadata" "$ABS_LIBRARY_DIR"
+    docker image inspect "$ABS_IMAGE" >/dev/null 2>&1 || docker pull -q "$ABS_IMAGE" >/dev/null
+    local tz
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null) || tz=UTC
+    # Runs as us, so the library and database stay owned by us.
+    docker run -d --name "$ABS_CONTAINER" --restart unless-stopped \
+      --user "$(id -u):$(id -g)" -p "127.0.0.1:$ABS_PORT:80" -e TZ="${tz:-UTC}" \
+      -v "$DATA_DIR/abs/config:/config" -v "$DATA_DIR/abs/metadata:/metadata" \
+      -v "$(realpath "$ABS_LIBRARY_DIR"):/audiobooks" \
+      "$ABS_IMAGE" >/dev/null
+  elif [[ $state != running ]]; then
+    docker start "$ABS_CONTAINER" >/dev/null
+  fi
+
+  local _
+  for _ in $(seq 1 60); do abs_running && break; sleep 1; done
+  abs_running || die "Audiobookshelf didn't start; see: docker logs $ABS_CONTAINER"
+  abs_bootstrap
+}
+
+# First start: create the admin account (you, with a generated password), a
+# book library on /audiobooks, and an API key for this tool. Later starts
+# only re-create the key if it stopped working.
+abs_bootstrap() {
+  if curl -sf -m 5 "$ABS_URL/status" | jq -e '.isInit == false' >/dev/null; then
+    [[ -n $ABS_USERNAME ]] || save_credential ABS_USERNAME "$USER"
+    # Saved before /init so a crash between the two can't lock us out.
+    [[ -n $ABS_PASSWORD ]] || save_credential ABS_PASSWORD "$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+    jq -nc --arg u "$ABS_USERNAME" --arg p "$ABS_PASSWORD" '{newRoot: {username: $u, password: $p}}' |
+      curl -sf -m 10 -H "Content-Type: application/json" --data @- "$ABS_URL/init" >/dev/null ||
+      die "couldn't initialise Audiobookshelf"
+  fi
+
+  [[ -n $ABS_TOKEN ]] && abs_api GET /api/libraries >/dev/null && return 0
+  [[ -n $ABS_USERNAME && -n $ABS_PASSWORD ]] ||
+    die "no login for $ABS_URL — it was set up outside this plugin"
+
+  local login access user_id libs
+  login=$(jq -nc --arg u "$ABS_USERNAME" --arg p "$ABS_PASSWORD" '{username: $u, password: $p}' |
+    curl -sf -m 10 -H "Content-Type: application/json" --data @- "$ABS_URL/login") ||
+    die "Audiobookshelf rejected the saved login for $ABS_USERNAME"
+  access=$(jq -r '.user.accessToken' <<<"$login")
+  user_id=$(jq -r '.user.id' <<<"$login")
+
+  libs=$(curl -sf -m 10 -H "Authorization: Bearer $access" "$ABS_URL/api/libraries")
+  if ! jq -e '.libraries[] | select(.folders[].fullPath == "/audiobooks")' <<<"$libs" >/dev/null; then
+    local lib
+    lib=$(jq -nc '{name: "Audiobooks", folders: [{fullPath: "/audiobooks"}], mediaType: "book"}' |
+      curl -sf -m 30 -H "Authorization: Bearer $access" -H "Content-Type: application/json" \
+        --data @- "$ABS_URL/api/libraries" | jq -r '.id // empty')
+    [[ -n $lib ]] || die "couldn't create the Audiobookshelf library"
+    # A new library only watches for changes; scan what's already in the
+    # folder. ABS keeps scanning after we stop waiting.
+    curl -s -m 5 -X POST -H "Authorization: Bearer $access" "$ABS_URL/api/libraries/$lib/scan" >/dev/null || true
+  fi
+
+  local key
+  key=$(jq -nc --arg u "$user_id" '{name: "omarchy-audiobook", userId: $u, isActive: true}' |
+    curl -sf -m 10 -H "Authorization: Bearer $access" -H "Content-Type: application/json" \
+      --data @- "$ABS_URL/api/api-keys" | jq -r '.apiKey.apiKey // empty')
+  [[ -n $key ]] || die "couldn't create an Audiobookshelf API key"
+  save_credential ABS_TOKEN "$key"
+}
+
+# If the user already fronts this port with `tailscale serve` (HTTPS,
+# tailnet-only), that's the address a phone app should use. Read-only: the
+# plugin never changes Tailscale.
+abs_tailnet_url() {
+  command -v tailscale >/dev/null || return 0
+  tailscale serve status --json 2>/dev/null | jq -r --arg port "$ABS_PORT" '
+    (.Web // {}) | to_entries[]
+    | select([.value.Handlers[]?.Proxy // ""] | any(test("(127\\.0\\.0\\.1|localhost):" + $port + "/?$")))
+    | .key | sub(":443$"; "") | "https://" + .' 2>/dev/null | head -n1 || true
+}
+
+# Prints "<library id>|<folder path as ABS sees it>|<host path>" for the book
+# library we import into. With a token, ask ABS and map its folder back to the
+# host through the container's mounts; without one, fall back to /audiobooks.
+abs_resolve_library() {
+  local libs
+  if [[ -n $ABS_TOKEN ]] && libs=$(abs_api GET /api/libraries); then
+    while IFS=$'\t' read -r id folder; do
+      local host
+      host=$(container_mount "$ABS_CONTAINER" "$folder")
+      [[ -z $host && -d $folder ]] && host=$folder # ABS running natively
+      [[ -n $host && -d $host ]] && { printf '%s|%s|%s\n' "$id" "$folder" "$host"; return 0; }
+    done < <(jq -r --arg want "$ABS_LIBRARY_ID" '
+      .libraries[] | select(.mediaType == "book") | select($want == "" or .id == $want)
+      | .id as $id | .folders[] | [$id, .fullPath] | @tsv' <<<"$libs")
+  fi
+  local host
+  host=$(container_mount "$ABS_CONTAINER" /audiobooks)
+  [[ -n $host && -d $host ]] && { printf '|/audiobooks|%s\n' "$host"; return 0; }
+  return 1
+}
+
+# Scan the library and wait for the new folder to become an item; prints its id.
+abs_find_item() { # <library id> <item path inside ABS> <title>
+  local lib=$1 path=$2 query id
+  query=$(jq -rn --arg s "$3" '$s | @uri')
+  ABS_TIMEOUT=300 abs_api POST "/api/libraries/$lib/scan" >/dev/null || true
+  for _ in $(seq 1 30); do
+    id=$(abs_api GET "/api/libraries/$lib/search?q=$query&limit=25" |
+      jq -r --arg p "$path" '[.book[]?.libraryItem | select(.path == $p) | .id][0] // empty' 2>/dev/null) || true
+    [[ -n $id ]] && { echo "$id"; return 0; }
+    sleep 2
+  done
+  return 1
+}
+
+sanitize() { # filesystem-safe folder name
+  local s=${1//[\/:*?\"<>|]/-}
+  s=$(sed -E 's/^[. ]+|[. ]+$//g' <<<"$s")
+  echo "${s:-Unknown}"
+}
+
+# Copy into <root>/<Author>/<Title>[ (n)]/ and print the folder used.
+file_book() { # <root> <m4b> <title> <author>
+  local root=$1 m4b=$2 title=$3 author=$4 rel dest n=2
+  rel="$(sanitize "$author")/$(sanitize "$title")"
+  dest="$root/$rel"
+  while [[ -e $dest ]]; do dest="$root/$rel ($n)"; n=$((n + 1)); done
+  mkdir -p "$dest"
+  cp "$m4b" "$dest/$(sanitize "$title").m4b"
+  [[ -f ${m4b%.m4b}.vtt ]] && cp "${m4b%.m4b}.vtt" "$dest/$(sanitize "$title").vtt"
+  echo "$dest"
+}
+
+# ---- the job runner (runs inside the systemd unit) -----------------------------
+
+run_job() {
+  JOB_ID=$1
+  local id=$1 src name work log code
+  src=$(job_get "$id" .source)
+  name=$(basename "$src")
+  log=$(job_get "$id" .log)
+  work="$DATA_DIR/work/$id"
+  exec 2>>"$log"
+
+  # Anything that aborts the runner (die, set -e) still has to land the job
+  # in a final state, or the bar would show it queued forever.
+  on_exit() {
+    local rc=$?
+    docker rm -f "omarchy-audiobook-$JOB_ID" >/dev/null 2>&1 || true
+    rm -rf "$DATA_DIR/work/$JOB_ID"
+    ((rc == 0 || rc == 143)) && return
+    if jq -e '.state | IN("queued", "converting", "importing")' "$(job_file "$JOB_ID")" >/dev/null 2>&1; then
+      job_update "$JOB_ID" '.state = "failed" | .finished = now | .error = $e' --arg e "$(tail -n1 "$(job_get "$JOB_ID" .log)" | cut -c1-200)"
+      notify -u critical "Audiobook failed" "$(job_get "$JOB_ID" .title)"
+    fi
+  }
+  trap on_exit EXIT
+
+  on_term() {
+    trap - TERM INT
+    job_update "$JOB_ID" '.state = "cancelled" | .finished = now'
+    exit 143
+  }
+  trap on_term TERM INT
+
+  # One narration at a time; later jobs sit in "queued" until the GPU frees up.
+  exec 9>"$STATE_DIR/gpu.lock"
+  flock 9
+
+  # First run on a new machine: get the engine, showing download progress.
+  pull_progress() {
+    job_update "$JOB_ID" '.phase = $p | .progress = ($d | tonumber) / ($t | tonumber)' \
+      --arg p "Downloading ebook2audiobook ($(numfmt --to=si "$1")B / $(numfmt --to=si "$2")B)" --arg d "$1" --arg t "$2"
+  }
+  local problem
+  if ! engine_present; then
+    job_update "$id" '.state = "converting" | .phase = "Downloading ebook2audiobook" | .progress = 0'
+  fi
+  if ! problem=$(ensure_engine pull_progress); then
+    job_update "$id" '.state = "failed" | .finished = now | .error = $e | .problem = $p' \
+      --arg e "$(problem_message "$problem")" --arg p "$problem"
+    notify -u critical "Audiobook needs setup" "$(problem_message "$problem") — click to fix" \
+      --exec omarchy-launch-floating-terminal-with-presentation "$SELF doctor --fix"
+    exit 1
+  fi
+  ensure_models_dir
+  # An empty cache means e2a downloads ~2 GB of models before narrating; say so
+  # instead of sitting on "Preparing book" for minutes.
+  local first_run=0
+  [[ -z $(ls -A "$(realpath "$E2A_MODELS_DIR")" 2>/dev/null) ]] && first_run=1
+
+  job_update "$id" '.state = "converting" | .phase = "Preparing book" | .progress = 0 | .started = now'
+  mkdir -p "$work/out"
+  cp "$src" "$work/$name"
+
+  # The image runs as root; hand the outputs (and the model cache) back to us
+  # before exiting so cleanup never needs root. Everything else lives in
+  # anonymous volumes that --rm throws away.
+  local gpu=()
+  [[ $(engine_device) == cuda ]] && gpu=(--gpus all)
+  set +e
+  docker run --rm --name "omarchy-audiobook-$id" "${gpu[@]}" \
+    -e OWNER="$(id -u):$(id -g)" \
+    -v "$(realpath "$E2A_MODELS_DIR"):/app/models" -v "$work:/work" \
+    --entrypoint bash "$(engine_image)" -c '
+      bash ebook2audiobook.command --script_mode full_docker "$@"
+      rc=$?
+      chown -R "$OWNER" /work /app/models 2>/dev/null
+      exit $rc' e2a \
+    --headless --ebook "/work/$name" --output_dir /work/out --output_format m4b \
+    --device "$(engine_device)" --language "$E2A_LANGUAGE" "${E2A_EXTRA_ARGS[@]}" 2>&1 |
+    tee -a "$log" |
+    gawk -v RS='[\r\n]+' -v first_run="$first_run" '
+      match($0, /^([0-9.]+)%:[^0-9]*([0-9]+)\/([0-9]+)/, m) { print "progress\t" m[1] "\t" m[2] "\t" m[3]; fflush(); next }
+      /^Downloading https/ && !dl++          { print "phase\tDownloading language models (first run)"; fflush(); next }
+      /^Preparing .* conversion/ && first_run { print "phase\tDownloading voice model (~2 GB, first run)"; fflush(); next }
+      /^Loading TTS/                         { print "phase\tLoading voice model"; fflush(); next }
+      /^Combining sentences and chapters/    { print "phase\tAssembling audiobook"; fflush(); next }
+      /^Export - /                           { print "phase\tExporting M4B"; fflush(); next }
+    ' |
+    {
+      last=""
+      while IFS=$'\t' read -r kind a b c; do
+        case $kind in
+          progress)
+            # Only rewrite the file when the whole percent moves.
+            [[ ${a%.*} == "$last" ]] && continue
+            last=${a%.*}
+            job_update "$id" '.phase = "Narrating" | .progress = ($p | tonumber / 100)
+              | .sentences = ($n | tonumber) | .total = ($t | tonumber)
+              | .tts_started = (.tts_started // now)' --arg p "$a" --arg n "$b" --arg t "$c"
+            ;;
+          phase) job_update "$id" '.phase = $v' --arg v "$a" ;;
+        esac
+      done
+    }
+  code=${PIPESTATUS[0]}
+  set -e
+
+  local m4b
+  m4b=$(find "$work/out" -maxdepth 1 -name '*.m4b' -print -quit 2>/dev/null)
+  if ((code != 0)) || [[ -z $m4b ]]; then
+    local reason
+    reason=$(grep -m1 -iE '^(error|.*failed)' "$log" | cut -c1-200) || true
+    job_update "$id" '.state = "failed" | .finished = now | .error = $e' --arg e "${reason:-ebook2audiobook exited with $code}"
+    notify -u critical "Audiobook failed" "$(job_get "$id" .title): ${reason:-see omarchy-audiobook log $id}"
+    exit 1
+  fi
+
+  local title author
+  title=$(ffprobe -v quiet -of json -show_format "$m4b" | jq -r '.format.tags.title // empty')
+  author=$(ffprobe -v quiet -of json -show_format "$m4b" | jq -r '.format.tags.artist // .format.tags.album_artist // empty')
+  title=${title:-$(job_get "$id" .title)}
+  author=${author:-Unknown Author}
+  job_update "$id" '.title = $t | .author = $a | .progress = 1' --arg t "$title" --arg a "$author"
+
+  # ---- hand off to Audiobookshelf, or file it under $OUTPUT_DIR ----
+  abs_up >/dev/null || true
+  local library link dest
+  if abs_running && library=$(abs_resolve_library); then
+    local lib_id lib_path lib_host
+    IFS='|' read -r lib_id lib_path lib_host <<<"$library"
+    job_update "$id" '.state = "importing" | .phase = "Adding to Audiobookshelf"'
+    dest=$(file_book "$lib_host" "$m4b" "$title" "$author")
+
+    link="$ABS_URL/audiobookshelf/"
+    if [[ -n $ABS_TOKEN && -n $lib_id ]]; then
+      local item
+      if item=$(abs_find_item "$lib_id" "$lib_path/${dest#"$lib_host/"}" "$title"); then
+        link="$ABS_URL/audiobookshelf/item/$item"
+      fi
+    fi
+    job_update "$id" '.state = "done" | .finished = now | .output = $o | .link = $l | .phase = "In Audiobookshelf"' \
+      --arg o "$dest" --arg l "$link"
+    notify -u normal "Audiobook ready" "$title — $author" --exec xdg-open "$link"
+  else
+    dest=$(file_book "$OUTPUT_DIR" "$m4b" "$title" "$author")
+    job_update "$id" '.state = "done" | .finished = now | .output = $o | .link = $l | .phase = "Saved (Audiobookshelf unreachable)"' \
+      --arg o "$dest" --arg l "file://$dest"
+    notify -u normal "Audiobook ready" "$title — saved to ${dest/#$HOME/\~}" --exec xdg-open "$dest"
+  fi
+}
+
+# ---- commands --------------------------------------------------------------------
+
+cmd_convert() {
+  (($#)) || die "usage: omarchy-audiobook convert <file.epub>..."
+  local f
+  for f in "$@"; do
+    [[ -f $f ]] || die "no such file: $f"
+    f=$(realpath "$f")
+    local id title
+    id="$(date +%Y%m%d-%H%M%S)-$(head -c2 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    title=$(basename "${f%.*}")
+    jq -n --arg id "$id" --arg src "$f" --arg title "$title" --arg log "$JOBS_DIR/$id.log" \
+      '{id: $id, source: $src, title: $title, author: "", state: "queued", phase: "Waiting for GPU",
+        progress: 0, created: now, log: $log}' >"$(job_file "$id")"
+    systemd-run --user --quiet --collect --unit="omarchy-audiobook-$id" \
+      --description="Audiobook: $title" --setenv=PATH="$PATH" -- "$SELF" _run "$id"
+    notify "Converting to audiobook" "$title"
+    echo "$id"
+  done
+}
+
+# JSON for the bar widget: every job, newest first, with ETA worked out here,
+# plus whether the engine is ready.
+cmd_status() {
+  local configured=false running=false problem present=false
+  [[ -n $ABS_TOKEN ]] && configured=true
+  abs_running && running=true
+  problem=$(engine_problem)
+  [[ -z $problem ]] && engine_present && present=true
+  shopt -s nullglob
+  local files=("$JOBS_DIR"/*.json)
+  { if ((${#files[@]})); then cat "${files[@]}"; fi; } |
+    jq -s --argjson configured "$configured" --argjson running "$running" --arg url "$ABS_URL" --argjson managed "$ABS_MANAGED" \
+      --arg image "$(engine_image)" --arg device "$(engine_device)" --argjson present "$present" \
+      --arg problem "$problem" --arg message "$( [[ -n $problem ]] && problem_message "$problem")" \
+      --slurpfile engine <(cat "$ENGINE_FILE" 2>/dev/null || echo '{}') '
+      now as $now
+      | map(. + (if .state == "converting" and (.progress // 0) > 0.005 and .tts_started
+                 then {eta: ((($now - .tts_started) / .progress) * (1 - .progress) | floor)} else {} end)
+              + (if .started then {elapsed: (((.finished // $now) - .started) | floor)} else {} end))
+      | sort_by(.created) | reverse
+      | {abs: {configured: $configured, running: $running, url: $url, managed: $managed},
+         engine: {image: $image, device: $device, present: $present,
+                  problem: (if $problem == "" then null else $problem end),
+                  message: (if $message == "" then null else $message end),
+                  pulling: ($engine[0].pulling // null)},
+         jobs: .}'
+}
+
+# Recent EPUBs from the usual places, newest first.
+cmd_epubs() {
+  local dirs=() d
+  for d in "${EPUB_DIRS[@]}"; do [[ -d $d ]] && dirs+=("$d"); done
+  ((${#dirs[@]})) || { echo "[]"; return; }
+  find "${dirs[@]}" -maxdepth 4 -iname '*.epub' -printf '%T@\t%p\n' 2>/dev/null |
+    sort -rn | gawk -v n="${1:-12}" 'NR <= n' |
+    jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+      | {path: .[1], name: (.[1] | split("/") | last | sub("\\.epub$"; ""; "i")), mtime: (.[0] | tonumber | floor)})'
+}
+
+cmd_cancel() {
+  local id=${1:?usage: omarchy-audiobook cancel <id>}
+  docker rm -f "omarchy-audiobook-$id" >/dev/null 2>&1 || true
+  if systemctl --user is-active --quiet "omarchy-audiobook-$id.service"; then
+    systemctl --user stop "omarchy-audiobook-$id.service"
+  else
+    job_update "$id" 'if .state == "queued" or .state == "converting" then .state = "cancelled" | .finished = now else . end'
+  fi
+}
+
+cmd_open() {
+  local link
+  link=$(job_get "${1:?usage: omarchy-audiobook open <id>}" .link)
+  [[ -n $link ]] && exec xdg-open "$link"
+  die "job $1 has nothing to open yet"
+}
+
+cmd_clear() {
+  local f
+  for f in "$JOBS_DIR"/*.json; do
+    [[ -f $f ]] || continue
+    if jq -e '.state | IN("done", "failed", "cancelled")' "$f" >/dev/null; then
+      rm -f "$f" "${f%.json}.log"
+    fi
+  done
+}
+
+# Report (and with --fix, repair) everything a conversion depends on. --fix
+# is meant to run in a terminal, since packages and the docker group need sudo.
+cmd_doctor() {
+  local fix=false problem
+  [[ ${1:-} == --fix ]] && fix=true
+  echo "Engine:  $(engine_image) ($(engine_device))"
+
+  while problem=$(engine_problem) && [[ -n $problem ]]; do
+    echo "Problem: $(problem_message "$problem")"
+    $fix || { echo "Run: omarchy-audiobook doctor --fix"; return 1; }
+    case $problem in
+      docker-missing)
+        omarchy-pkg-add docker
+        sudo systemctl enable --now docker.service
+        sudo usermod -aG docker "$USER"
+        ;;
+      docker-stopped) sudo systemctl enable --now docker.service ;;
+      docker-permission)
+        sudo usermod -aG docker "$USER"
+        echo "Added $USER to the docker group. Log out and back in, then convert again."
+        return 1
+        ;;
+      gpu-runtime-missing)
+        echo "Installing the NVIDIA container toolkit. Restarting Docker briefly stops running containers."
+        omarchy-pkg-add nvidia-container-toolkit
+        sudo nvidia-ctk runtime configure --runtime=docker
+        sudo systemctl restart docker.service
+        ;;
+    esac
+    # A fix that didn't take would loop forever; bail if the same problem is back.
+    [[ $(engine_problem) == "$problem" ]] && { echo "Still broken: $(problem_message "$problem")"; return 1; }
+  done
+
+  if engine_present; then
+    echo "Image:   downloaded"
+  elif $fix; then
+    echo "Image:   downloading (this happens once)…"
+    ensure_engine print_pull_progress >/dev/null
+    echo
+  else
+    echo "Image:   not downloaded yet (it downloads on first conversion)"
+  fi
+  if $ABS_MANAGED && $fix; then abs_up; fi
+  if abs_running; then
+    echo "Audiobookshelf: running at $ABS_URL"
+  elif $ABS_MANAGED; then
+    echo "Audiobookshelf: not running — run: omarchy-audiobook doctor --fix"
+    return 1
+  else
+    echo "Audiobookshelf: not reachable at $ABS_URL — books go to $OUTPUT_DIR"
+  fi
+  echo "All set."
+}
+
+print_pull_progress() {
+  printf '\r  %sB / %sB ' "$(numfmt --to=si "$1")" "$(numfmt --to=si "$2")" >/dev/tty 2>/dev/null || true
+}
+
+# Put the CLI on PATH and register the Open With handler. Idempotent; the
+# widget runs it on load so `omarchy plugin add` installs need no extra step.
+cmd_integrate() {
+  local bin="$HOME/.local/bin/omarchy-audiobook" apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$(dirname "$bin")" "$apps"
+  [[ $(readlink "$bin" 2>/dev/null) == "$SELF" ]] || ln -sfn "$SELF" "$bin"
+  local desktop
+  desktop=$(sed "s|^Exec=omarchy-audiobook |Exec=$bin |" "$PLUGIN_DIR/share/omarchy-audiobook.desktop")
+  if [[ $(cat "$apps/omarchy-audiobook.desktop" 2>/dev/null) != "$desktop" ]]; then
+    printf '%s\n' "$desktop" >"$apps/omarchy-audiobook.desktop"
+    update-desktop-database "$apps" 2>/dev/null || true
+  fi
+
+  # Bring up the plugin's Audiobookshelf the first time the widget loads (or
+  # after an upgrade moves its image). Docker restarts it at boot after that.
+  if $ABS_MANAGED && [[ -z $(docker_problem) ]] &&
+    [[ $(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$ABS_CONTAINER" 2>/dev/null) != "true $ABS_IMAGE" ]]; then
+    systemd-run --user --quiet --collect --unit=omarchy-audiobook-server \
+      --setenv=PATH="$PATH" -- "$SELF" server up 2>/dev/null || true
+  fi
+}
+
+# `server` on its own prints how to sign in from Absorb (or any ABS app).
+cmd_server() {
+  case ${1:-} in
+    up) abs_up ;;
+    down) docker stop "$ABS_CONTAINER" >/dev/null ;;
+    password) [[ -n $ABS_PASSWORD ]] && echo "$ABS_PASSWORD" || die "no saved password" ;;
+    copy-password)
+      [[ -n $ABS_PASSWORD ]] || die "no saved password"
+      printf '%s' "$ABS_PASSWORD" | wl-copy
+      notify "Audiobookshelf password copied" "Sign in as $ABS_USERNAME"
+      ;;
+    info)
+      local running=false
+      abs_running && running=true
+      jq -nc --arg url "$ABS_URL" --arg tailnet "$(abs_tailnet_url)" --arg user "$ABS_USERNAME" \
+        --arg lib "$ABS_LIBRARY_DIR" --argjson running "$running" --argjson managed "$ABS_MANAGED" \
+        '{managed: $managed, running: $running, url: $url, tailnet: ($tailnet | select(. != "")),
+          username: $user, library: $lib}'
+      ;;
+    "")
+      local info
+      info=$(cmd_server info)
+      echo "Audiobookshelf ($(jq -r 'if .running then "running" else "not running" end' <<<"$info"))"
+      echo "  On this PC: $ABS_URL"
+      jq -r 'if .tailnet then "  Tailnet:    \(.tailnet)" else "  Tailnet:    not set up (see README: Absorb)" end' <<<"$info"
+      echo "  Username:   ${ABS_USERNAME:-?}"
+      echo "  Password:   omarchy-audiobook server password"
+      echo "  Library:    $ABS_LIBRARY_DIR"
+      ;;
+    *) die "usage: omarchy-audiobook server [info|up|down|password|copy-password]" ;;
+  esac
+}
+
+cmd_setup() {
+  echo "Audiobookshelf at $ABS_URL"
+  echo "Create an API key in Audiobookshelf: Settings → API Keys → Add API Key"
+  echo "(or copy the legacy token from Settings → Users → your user)."
+  echo
+  local token
+  read -r -s -p "API key: " token
+  echo
+  [[ -n $token ]] || die "no key entered"
+  local libs
+  libs=$(curl -sf -m 10 -H "Authorization: Bearer $token" "$ABS_URL/api/libraries") ||
+    die "that key was rejected by $ABS_URL"
+  echo "Libraries: $(jq -r '[.libraries[] | select(.mediaType == "book") | .name] | join(", ")' <<<"$libs")"
+
+  save_credential ABS_TOKEN "$token"
+  echo "Saved to $CREDENTIALS_FILE"
+}
+
+case "${1:-}" in
+  convert) shift; cmd_convert "$@" ;;
+  status) cmd_status ;;
+  epubs) shift; cmd_epubs "$@" ;;
+  cancel) shift; cmd_cancel "$@" ;;
+  open) shift; cmd_open "$@" ;;
+  log) exec less +F "$(job_get "${2:?usage: omarchy-audiobook log <id>}" .log)" ;;
+  clear) cmd_clear ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  engine)
+    [[ ${2:-} == pull ]] || die "usage: omarchy-audiobook engine pull"
+    problem=$(ensure_engine) || die "$(problem_message "$problem") — run: omarchy-audiobook doctor --fix"
+    ;;
+  server) shift; cmd_server "$@" ;;
+  setup) cmd_setup ;;
+  version | --version | -v) jq -r .version "$PLUGIN_DIR/manifest.json" ;;
+  _integrate) cmd_integrate ;;
+  _run) shift; run_job "$1" ;;
+  *.epub | *.EPUB) cmd_convert "$@" ;;
+  *)
+    echo "Usage: omarchy-audiobook <command>"
+    echo "  convert <file.epub>...  queue EPUBs for conversion (GPU, one at a time)"
+    echo "  status                  JSON of all jobs and the engine"
+    echo "  epubs [n]               JSON of recent EPUBs in \${EPUB_DIRS[@]}"
+    echo "  cancel <id>             stop a queued or running job"
+    echo "  open <id>               open a finished audiobook"
+    echo "  log <id>                follow a job's ebook2audiobook log"
+    echo "  clear                   forget finished jobs"
+    echo "  doctor [--fix]          check (and repair) Docker, GPU access and the image"
+    echo "  engine pull             download the ebook2audiobook image now"
+    echo "  server [info|up|down]   the plugin's Audiobookshelf; no args: how to sign in from Absorb"
+    echo "  setup                   save an API key for an Audiobookshelf you run yourself"
+    echo "  version                 print the plugin version"
+    echo
+    echo "Config: $CONFIG_FILE"
+    exit 1
+    ;;
+esac

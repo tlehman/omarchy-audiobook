@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-audiobook",
+  "name": "omarchy-audiobook",
+  "version": "0.3.0",
+  "author": "Tobi Lehman",
+  "license": "MIT",
+  "description": "Turn EPUBs into M4B audiobooks with ebook2audiobook on the local GPU, then drop them into Audiobookshelf.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Audiobooks",
+    "description": "Convert EPUBs to audiobooks on the GPU and import them into Audiobookshelf.",
+    "category": "Media",
+    "aliases": [
+      "audiobook",
+      "epub",
+      "tts",
+      "audiobookshelf"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

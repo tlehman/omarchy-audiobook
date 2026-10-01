@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Convert to Audiobook
+Comment=Narrate this EPUB with ebook2audiobook and add it to Audiobookshelf
+Icon=audio-headphones
+Exec=omarchy-audiobook convert %F
+MimeType=application/epub+zip;
+Terminal=false
+NoDisplay=true
+Categories=AudioVideo;
