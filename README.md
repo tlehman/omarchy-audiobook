@@ -48,15 +48,16 @@ books skip that step.
 
 ## Converting
 
-- Click 󰋋 in the bar. The panel lists your most recent EPUBs (Downloads,
-  Documents, Books, Archive/Books, Archive/Calibre); click one.
+- Click the headphones icon in the bar. The panel lists your most recent
+  EPUBs (Downloads, Documents, Books, Archive/Books, Archive/Calibre); click
+  one.
 - In Files, right-click an EPUB and pick **Open With → Convert to Audiobook**.
 - From a terminal, run `omarchy-audiobook convert book.epub [more.epub…]`.
 
 Each job runs in a transient systemd user unit, so it survives closing
 whatever started it. Books narrate one at a time; the rest wait as
-"queued". The bar shows `󰋋 42%` while a job runs, and the panel shows
-progress, the time left and a cancel button.
+"queued". While a job runs, the bar shows its percentage next to the icon,
+and the panel shows progress, the time left and a cancel button.
 
 ## Audiobookshelf
 
