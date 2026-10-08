@@ -8,6 +8,28 @@ fixes bump patch. Add entries under **Unreleased**, then run
 
 ## Unreleased
 
+- Fix: a book that finished narrating was deleted when Audiobookshelf didn't
+  answer at import time. Bringing the server up could exit the runner, and
+  its cleanup removed the work folder that held the M4B. A server problem now
+  sends the book to `OUTPUT_DIR` instead.
+- The plugin restarts its Audiobookshelf container when Docker shows it as up
+  but it doesn't answer, for example after its veth was deleted. Both
+  `server up` and the widget's load check do this.
+- Failed jobs keep their work: the finished M4B, or ebook2audiobook's
+  session, which now lives on the host instead of in a volume that `--rm`
+  threw away. New `retry [--fresh] <id>` files the M4B or resumes narration
+  from the last saved sentence. The panel and the failure notification offer
+  it.
+- The resume ETA counts only sentences narrated in this run.
+- Failure messages skip onnxruntime warnings and report a killed container
+  as such.
+- Fix: `server info` printed nothing (and the panel showed no server
+  details) when no Tailscale Serve address fronts the server.
+- `clear` keeps failed jobs that can resume; `clear --all` drops them too.
+- Books are copied into the library under a temporary name and then renamed,
+  so Audiobookshelf never scans a half-written file. A failed copy no longer
+  counts as filed.
+
 ## 0.3.0 — 2026-09-30
 
 - The plugin runs its own Audiobookshelf 2.37.1 (`omarchy-audiobook-abs`) in

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # omarchy:summary=Convert an EPUB into an M4B audiobook on the GPU and import it into Audiobookshelf
-# omarchy:args=<convert <file.epub>...|status|epubs|cancel <id>|open <id>|log <id>|clear|doctor [--fix]|server [info|up|down|password|copy-password]|engine pull|version>
+# omarchy:args=<convert <file.epub>...|status|epubs|cancel <id>|retry [--fresh] <id>|open <id>|log <id>|clear [--all]|doctor [--fix]|server [info|up|down|password|copy-password]|engine pull|version>
 
 # Runs ebook2audiobook headlessly from its published Docker image, one
 # throwaway container per book, one book at a time so the GPU is never shared.
@@ -234,6 +234,12 @@ abs_running() {
   curl -sf -m 3 "$ABS_URL/status" | jq -e '.app == "audiobookshelf"' >/dev/null 2>&1
 }
 
+abs_wait() { # <seconds>
+  local _
+  for _ in $(seq 1 "$1"); do abs_running && return 0; sleep 1; done
+  return 1
+}
+
 abs_api() { # <method> <path> [curl args...]
   curl -sf -m "${ABS_TIMEOUT:-15}" -X "$1" -H "Authorization: Bearer $ABS_TOKEN" "${@:3}" "$ABS_URL$2"
 }
@@ -289,9 +295,16 @@ abs_up() {
     docker start "$ABS_CONTAINER" >/dev/null
   fi
 
-  local _
-  for _ in $(seq 1 60); do abs_running && break; sleep 1; done
-  abs_running || die "Audiobookshelf didn't start; see: docker logs $ABS_CONTAINER"
+  # A container that was already running should answer at once; give a fresh
+  # one a minute to boot.
+  abs_wait $([[ $state == running ]] && echo 5 || echo 60) || {
+    # Docker can report the container up while its port leads nowhere, e.g.
+    # after its veth was deleted or the network was reset under it. A
+    # restart rebuilds the networking.
+    echo "omarchy-audiobook: Audiobookshelf isn't answering at $ABS_URL; restarting $ABS_CONTAINER" >&2
+    docker restart "$ABS_CONTAINER" >/dev/null
+    abs_wait 60
+  } || die "Audiobookshelf didn't start; see: docker logs $ABS_CONTAINER"
   abs_bootstrap
 }
 
@@ -397,17 +410,49 @@ file_book() { # <root> <m4b> <title> <author>
   rel="$(sanitize "$author")/$(sanitize "$title")"
   dest="$root/$rel"
   while [[ -e $dest ]]; do dest="$root/$rel ($n)"; n=$((n + 1)); done
-  mkdir -p "$dest"
-  cp "$m4b" "$dest/$(sanitize "$title").m4b"
-  [[ -f ${m4b%.m4b}.vtt ]] && cp "${m4b%.m4b}.vtt" "$dest/$(sanitize "$title").vtt"
+  mkdir -p "$dest" || return 1
+  # Copy under a hidden name and rename, so Audiobookshelf never scans a
+  # half-written file. The source stays put until the job is done.
+  local file
+  file="$dest/$(sanitize "$title").m4b"
+  cp "$m4b" "$dest/.partial.m4b" && mv -f "$dest/.partial.m4b" "$file" || { rm -rf "$dest"; return 1; }
+  [[ -f ${m4b%.m4b}.vtt ]] && cp "${m4b%.m4b}.vtt" "${file%.m4b}.vtt"
   echo "$dest"
+}
+
+# Remove a job's work folder. Files a killed container left behind are owned
+# by root, so fall back to deleting them from inside the image.
+work_rm() { # <id>
+  local dir="$DATA_DIR/work/$1"
+  [[ -e $dir ]] || return 0
+  rm -rf "$dir" 2>/dev/null && return 0
+  docker run --rm -v "$DATA_DIR/work:/w" --entrypoint rm "$(engine_image)" -rf "/w/$1" >/dev/null 2>&1 || true
+}
+
+# What's left of an interrupted job: "m4b" when the book is narrated but not
+# filed yet, "session" when ebook2audiobook can pick up where it stopped.
+work_resumable() { # <id>
+  local work="$DATA_DIR/work/$1"
+  if [[ -n $(find "$work/out" -maxdepth 1 -name '*.m4b' -print -quit 2>/dev/null) ]]; then echo m4b
+  elif compgen -G "$work/tmp/proc-*" >/dev/null; then echo session
+  fi
+}
+
+# Last meaningful line of a log, without colour codes or progress bars.
+log_reason() { # <log>
+  tail -n 200 "$1" 2>/dev/null | tr '\r' '\n' | sed -E 's/\x1b\[[0-9;]*m//g' |
+    grep -vE '^\s*$|^\s*[0-9]+%\||telemetry|^\*+$' | tail -n1 | cut -c1-200
 }
 
 # ---- the job runner (runs inside the systemd unit) -----------------------------
 
+# A job's work folder ($DATA_DIR/work/<id>) holds the EPUB copy, the
+# finished M4B (out/) and ebook2audiobook's session (tmp/, mounted at
+# /app/tmp). It is only deleted once the book is filed or the job is
+# cancelled, so a crash at hour nine costs a `retry`, not another nine hours.
 run_job() {
   JOB_ID=$1
-  local id=$1 src name work log code
+  local id=$1 src name work log
   src=$(job_get "$id" .source)
   name=$(basename "$src")
   log=$(job_get "$id" .log)
@@ -417,14 +462,28 @@ run_job() {
   # Anything that aborts the runner (die, set -e) still has to land the job
   # in a final state, or the bar would show it queued forever.
   on_exit() {
-    local rc=$?
+    local rc=$? state
     docker rm -f "omarchy-audiobook-$JOB_ID" >/dev/null 2>&1 || true
-    rm -rf "$DATA_DIR/work/$JOB_ID"
-    ((rc == 0 || rc == 143)) && return
-    if jq -e '.state | IN("queued", "converting", "importing")' "$(job_file "$JOB_ID")" >/dev/null 2>&1; then
-      job_update "$JOB_ID" '.state = "failed" | .finished = now | .error = $e' --arg e "$(tail -n1 "$(job_get "$JOB_ID" .log)" | cut -c1-200)"
-      notify -u critical "Audiobook failed" "$(job_get "$JOB_ID" .title)"
+    state=$(job_get "$JOB_ID" .state)
+    if [[ $state == done || $state == cancelled ]]; then
+      work_rm "$JOB_ID"
+      return
     fi
+    if [[ $state == queued || $state == converting || $state == importing ]]; then
+      job_update "$JOB_ID" '.state = "failed" | .finished = now | .error = $e' \
+        --arg e "$(log_reason "$(job_get "$JOB_ID" .log)")"
+    fi
+    local keep
+    keep=$(work_resumable "$JOB_ID")
+    job_update "$JOB_ID" '.resumable = ($k | select(. != ""))' --arg k "$keep"
+    case $keep in
+      m4b) notify -u critical "Audiobook narrated but not filed" "$(job_get "$JOB_ID" .title) — click to retry" \
+        --exec "$SELF retry $JOB_ID" ;;
+      session) notify -u critical "Audiobook failed" "$(job_get "$JOB_ID" .title) — click to resume" \
+        --exec "$SELF retry $JOB_ID" ;;
+      *) ((rc == 0)) || [[ -n $(job_get "$JOB_ID" .problem) ]] ||
+        notify -u critical "Audiobook failed" "$(job_get "$JOB_ID" .title)" ;;
+    esac
   }
   trap on_exit EXIT
 
@@ -434,6 +493,18 @@ run_job() {
     exit 143
   }
   trap on_term TERM INT
+
+  job_update "$id" 'del(.error, .finished, .problem, .resumable)'
+  [[ $(work_resumable "$id") == m4b ]] || narrate "$id"
+  import_book "$id"
+}
+
+narrate() { # <id>
+  local id=$1 src name work log code
+  src=$(job_get "$id" .source)
+  name=$(basename "$src")
+  log=$(job_get "$id" .log)
+  work="$DATA_DIR/work/$id"
 
   # One narration at a time; later jobs sit in "queued" until the GPU frees up.
   exec 9>"$STATE_DIR/gpu.lock"
@@ -461,26 +532,43 @@ run_job() {
   local first_run=0
   [[ -z $(ls -A "$(realpath "$E2A_MODELS_DIR")" 2>/dev/null) ]] && first_run=1
 
-  job_update "$id" '.state = "converting" | .phase = "Preparing book" | .progress = 0 | .started = now'
-  mkdir -p "$work/out"
-  cp "$src" "$work/$name"
+  mkdir -p "$work/out" "$work/tmp"
+  if [[ ! -f $work/$name ]]; then
+    [[ -f $src ]] || die "the EPUB is gone: $src"
+    cp "$src" "$work/$name"
+  fi
+
+  # A session left by an interrupted run picks up at the sentence it reached.
+  local session_dir session=() phase="Preparing book"
+  session_dir=$(compgen -G "$work/tmp/proc-*" | head -n1) || true
+  if [[ -n $session_dir ]]; then
+    session=(--session "${session_dir##*/proc-}")
+    phase="Resuming narration"
+    echo "omarchy-audiobook: resuming session ${session_dir##*/proc-}" >&2
+  fi
+  local log_start
+  log_start=$(($(wc -l <"$log") + 1))
+  job_update "$id" '.state = "converting" | .phase = $ph | .progress = 0 | .started = (.started // now)
+    | del(.tts_started, .progress_base)' --arg ph "$phase"
 
   # The image runs as root; hand the outputs (and the model cache) back to us
-  # before exiting so cleanup never needs root. Everything else lives in
-  # anonymous volumes that --rm throws away.
+  # before exiting so cleanup never needs root. The session lives on the host
+  # (/app/tmp), so it outlives the container; the rest of the image's
+  # volumes are anonymous and --rm throws them away. A kept session makes e2a
+  # ask "[s]kip / [r]esume / [d]elete" on stdin; the answer is always resume.
   local gpu=()
   [[ $(engine_device) == cuda ]] && gpu=(--gpus all)
   set +e
-  docker run --rm --name "omarchy-audiobook-$id" "${gpu[@]}" \
+  docker run --rm -i --name "omarchy-audiobook-$id" "${gpu[@]}" \
     -e OWNER="$(id -u):$(id -g)" \
-    -v "$(realpath "$E2A_MODELS_DIR"):/app/models" -v "$work:/work" \
+    -v "$(realpath "$E2A_MODELS_DIR"):/app/models" -v "$work:/work" -v "$work/tmp:/app/tmp" \
     --entrypoint bash "$(engine_image)" -c '
       bash ebook2audiobook.command --script_mode full_docker "$@"
       rc=$?
-      chown -R "$OWNER" /work /app/models 2>/dev/null
+      chown -R "$OWNER" /work /app/tmp /app/models 2>/dev/null
       exit $rc' e2a \
     --headless --ebook "/work/$name" --output_dir /work/out --output_format m4b \
-    --device "$(engine_device)" --language "$E2A_LANGUAGE" "${E2A_EXTRA_ARGS[@]}" 2>&1 |
+    --device "$(engine_device)" --language "$E2A_LANGUAGE" "${session[@]}" "${E2A_EXTRA_ARGS[@]}" <<<r 2>&1 |
     tee -a "$log" |
     gawk -v RS='[\r\n]+' -v first_run="$first_run" '
       match($0, /^([0-9.]+)%:[^0-9]*([0-9]+)\/([0-9]+)/, m) { print "progress\t" m[1] "\t" m[2] "\t" m[3]; fflush(); next }
@@ -498,9 +586,15 @@ run_job() {
             # Only rewrite the file when the whole percent moves.
             [[ ${a%.*} == "$last" ]] && continue
             last=${a%.*}
-            job_update "$id" '.phase = "Narrating" | .progress = ($p | tonumber / 100)
-              | .sentences = ($n | tonumber) | .total = ($t | tonumber)
-              | .tts_started = (.tts_started // now)' --arg p "$a" --arg n "$b" --arg t "$c"
+            # The ETA counts from progress_base. A resumed session races
+            # through the sentences it already has, so a jump of more than
+            # 5% moves the base instead of counting as narration speed.
+            job_update "$id" '($p | tonumber / 100) as $new
+              | if .tts_started == null or $new - (.progress // 0) > 0.05
+                then .tts_started = now | .progress_base = $new else . end
+              | .phase = "Narrating" | .progress = $new
+              | .sentences = ($n | tonumber) | .total = ($t | tonumber)' \
+              --arg p "$a" --arg n "$b" --arg t "$c"
             ;;
           phase) job_update "$id" '.phase = $v' --arg v "$a" ;;
         esac
@@ -508,52 +602,75 @@ run_job() {
     }
   code=${PIPESTATUS[0]}
   set -e
+  exec 9>&-
 
-  local m4b
-  m4b=$(find "$work/out" -maxdepth 1 -name '*.m4b' -print -quit 2>/dev/null)
-  if ((code != 0)) || [[ -z $m4b ]]; then
+  if ((code != 0)) || [[ $(work_resumable "$id") != m4b ]]; then
     local reason
-    reason=$(grep -m1 -iE '^(error|.*failed)' "$log" | cut -c1-200) || true
+    case $code in
+      137) reason="ebook2audiobook was killed (out of memory, or its container was removed)" ;;
+      *)
+        # This run's lines only, skipping onnxruntime's [W:...] warnings.
+        reason=$(sed -n "$log_start,\$p" "$log" | tr '\r' '\n' | sed -E 's/\x1b\[[0-9;]*m//g' |
+          grep -vE '\[W:|telemetry' | grep -iE 'error|exception|failed|expired' | tail -n1 | cut -c1-200) || true
+        ;;
+    esac
     job_update "$id" '.state = "failed" | .finished = now | .error = $e' --arg e "${reason:-ebook2audiobook exited with $code}"
-    notify -u critical "Audiobook failed" "$(job_get "$id" .title): ${reason:-see omarchy-audiobook log $id}"
     exit 1
   fi
+}
 
-  local title author
-  title=$(ffprobe -v quiet -of json -show_format "$m4b" | jq -r '.format.tags.title // empty')
-  author=$(ffprobe -v quiet -of json -show_format "$m4b" | jq -r '.format.tags.artist // .format.tags.album_artist // empty')
+# File the narrated M4B: into Audiobookshelf when it's reachable, otherwise
+# under $OUTPUT_DIR. Nothing here may lose the book: the M4B stays in the
+# work folder until a copy is safely in place.
+import_book() { # <id>
+  local id=$1 m4b title author
+  m4b=$(find "$DATA_DIR/work/$id/out" -maxdepth 1 -name '*.m4b' -print -quit)
+  title=$(ffprobe -v quiet -of json -show_format "$m4b" | jq -r '.format.tags.title // empty') || true
+  author=$(ffprobe -v quiet -of json -show_format "$m4b" | jq -r '.format.tags.artist // .format.tags.album_artist // empty') || true
   title=${title:-$(job_get "$id" .title)}
   author=${author:-Unknown Author}
-  job_update "$id" '.title = $t | .author = $a | .progress = 1' --arg t "$title" --arg a "$author"
+  job_update "$id" '.state = "importing" | .phase = "Adding to Audiobookshelf" | .title = $t | .author = $a | .progress = 1' \
+    --arg t "$title" --arg a "$author"
 
-  # ---- hand off to Audiobookshelf, or file it under $OUTPUT_DIR ----
-  abs_up >/dev/null || true
+  # abs_up dies on any problem (Docker, port, login); keep that in a subshell
+  # so it can only send the book to the fallback folder.
+  (abs_up >/dev/null) || true
   local library link dest
   if abs_running && library=$(abs_resolve_library); then
     local lib_id lib_path lib_host
     IFS='|' read -r lib_id lib_path lib_host <<<"$library"
-    job_update "$id" '.state = "importing" | .phase = "Adding to Audiobookshelf"'
-    dest=$(file_book "$lib_host" "$m4b" "$title" "$author")
-
-    link="$ABS_URL/audiobookshelf/"
-    if [[ -n $ABS_TOKEN && -n $lib_id ]]; then
-      local item
-      if item=$(abs_find_item "$lib_id" "$lib_path/${dest#"$lib_host/"}" "$title"); then
-        link="$ABS_URL/audiobookshelf/item/$item"
+    if dest=$(file_book "$lib_host" "$m4b" "$title" "$author"); then
+      link="$ABS_URL/audiobookshelf/"
+      if [[ -n $ABS_TOKEN && -n $lib_id ]]; then
+        local item
+        if item=$(abs_find_item "$lib_id" "$lib_path/${dest#"$lib_host/"}" "$title"); then
+          link="$ABS_URL/audiobookshelf/item/$item"
+        fi
       fi
+      job_update "$id" '.state = "done" | .finished = now | .output = $o | .link = $l | .phase = "In Audiobookshelf"' \
+        --arg o "$dest" --arg l "$link"
+      notify -u normal "Audiobook ready" "$title — $author" --exec xdg-open "$link"
+      return
     fi
-    job_update "$id" '.state = "done" | .finished = now | .output = $o | .link = $l | .phase = "In Audiobookshelf"' \
-      --arg o "$dest" --arg l "$link"
-    notify -u normal "Audiobook ready" "$title — $author" --exec xdg-open "$link"
+    echo "omarchy-audiobook: couldn't copy into $lib_host; trying $OUTPUT_DIR" >&2
   else
-    dest=$(file_book "$OUTPUT_DIR" "$m4b" "$title" "$author")
-    job_update "$id" '.state = "done" | .finished = now | .output = $o | .link = $l | .phase = "Saved (Audiobookshelf unreachable)"' \
-      --arg o "$dest" --arg l "file://$dest"
-    notify -u normal "Audiobook ready" "$title — saved to ${dest/#$HOME/\~}" --exec xdg-open "$dest"
+    echo "omarchy-audiobook: Audiobookshelf isn't reachable at $ABS_URL; saving to $OUTPUT_DIR" >&2
   fi
+
+  dest=$(file_book "$OUTPUT_DIR" "$m4b" "$title" "$author") ||
+    die "couldn't save the audiobook to $OUTPUT_DIR; it's kept in $(dirname "$m4b") — run: omarchy-audiobook retry $id"
+  job_update "$id" '.state = "done" | .finished = now | .output = $o | .link = $l | .phase = "Saved (Audiobookshelf unreachable)"' \
+    --arg o "$dest" --arg l "file://$dest"
+  notify -u normal "Audiobook ready" "$title — saved to ${dest/#$HOME/\~}" --exec xdg-open "$dest"
 }
 
+
 # ---- commands --------------------------------------------------------------------
+
+start_job() { # <id>
+  systemd-run --user --quiet --collect --unit="omarchy-audiobook-$1" \
+    --description="Audiobook: $(job_get "$1" .title)" --setenv=PATH="$PATH" -- "$SELF" _run "$1"
+}
 
 cmd_convert() {
   (($#)) || die "usage: omarchy-audiobook convert <file.epub>..."
@@ -567,8 +684,7 @@ cmd_convert() {
     jq -n --arg id "$id" --arg src "$f" --arg title "$title" --arg log "$JOBS_DIR/$id.log" \
       '{id: $id, source: $src, title: $title, author: "", state: "queued", phase: "Waiting for GPU",
         progress: 0, created: now, log: $log}' >"$(job_file "$id")"
-    systemd-run --user --quiet --collect --unit="omarchy-audiobook-$id" \
-      --description="Audiobook: $title" --setenv=PATH="$PATH" -- "$SELF" _run "$id"
+    start_job "$id"
     notify "Converting to audiobook" "$title"
     echo "$id"
   done
@@ -590,8 +706,9 @@ cmd_status() {
       --arg problem "$problem" --arg message "$( [[ -n $problem ]] && problem_message "$problem")" \
       --slurpfile engine <(cat "$ENGINE_FILE" 2>/dev/null || echo '{}') '
       now as $now
-      | map(. + (if .state == "converting" and (.progress // 0) > 0.005 and .tts_started
-                 then {eta: ((($now - .tts_started) / .progress) * (1 - .progress) | floor)} else {} end)
+      | map(. + (if .state == "converting" and .tts_started and ((.progress // 0) - (.progress_base // 0)) > 0.005
+                 then {eta: ((($now - .tts_started) / (.progress - (.progress_base // 0))) * (1 - .progress) | floor)}
+                 else {} end)
               + (if .started then {elapsed: (((.finished // $now) - .started) | floor)} else {} end))
       | sort_by(.created) | reverse
       | {abs: {configured: $configured, running: $running, url: $url, managed: $managed},
@@ -623,6 +740,33 @@ cmd_cancel() {
   fi
 }
 
+# Run a failed or cancelled job again. A narrated M4B is only filed again; a
+# kept ebook2audiobook session resumes where it stopped. --fresh discards
+# the session and narrates from the start.
+cmd_retry() {
+  local id fresh=false
+  [[ ${1:-} == --fresh ]] && { fresh=true; shift; }
+  id=${1:?usage: omarchy-audiobook retry [--fresh] <id>}
+  [[ -f $(job_file "$id") ]] || die "no such job: $id"
+  systemctl --user is-active --quiet "omarchy-audiobook-$id.service" && die "job $id is still running"
+  case $(job_get "$id" .state) in
+    failed | cancelled) ;;
+    *) die "job $id is $(job_get "$id" .state), not failed" ;;
+  esac
+  if $fresh; then
+    work_rm "$id"
+  else
+    local kept
+    kept=$(work_resumable "$id")
+    [[ -n $kept ]] && echo "Resuming from the kept ${kept/session/narration session}" ||
+      echo "Nothing kept from the last run; narrating from the start"
+  fi
+  [[ -f $(job_get "$id" .source) || -n $(work_resumable "$id") ]] || die "the EPUB is gone: $(job_get "$id" .source)"
+  job_update "$id" '.state = "queued" | .phase = "Waiting for GPU" | .progress = 0
+    | del(.error, .finished, .problem, .resumable)'
+  start_job "$id"
+}
+
 cmd_open() {
   local link
   link=$(job_get "${1:?usage: omarchy-audiobook open <id>}" .link)
@@ -630,14 +774,23 @@ cmd_open() {
   die "job $1 has nothing to open yet"
 }
 
+# Forget finished jobs. Failed jobs that kept a narrated book or session stay
+# until they're retried, unless --all.
 cmd_clear() {
-  local f
+  local f id all=false kept=0
+  [[ ${1:-} == --all ]] && all=true
   for f in "$JOBS_DIR"/*.json; do
     [[ -f $f ]] || continue
-    if jq -e '.state | IN("done", "failed", "cancelled")' "$f" >/dev/null; then
-      rm -f "$f" "${f%.json}.log"
+    jq -e '.state | IN("done", "failed", "cancelled")' "$f" >/dev/null || continue
+    id=$(basename "$f" .json)
+    if ! $all && [[ -n $(work_resumable "$id") ]]; then
+      kept=$((kept + 1))
+      continue
     fi
+    work_rm "$id"
+    rm -f "$f" "${f%.json}.log" "$f".*
   done
+  ((kept == 0)) || echo "Kept $kept failed job(s) that can resume (omarchy-audiobook retry <id>); clear --all drops them"
 }
 
 # Report (and with --fix, repair) everything a conversion depends on. --fix
@@ -712,9 +865,11 @@ cmd_integrate() {
   fi
 
   # Bring up the plugin's Audiobookshelf the first time the widget loads (or
-  # after an upgrade moves its image). Docker restarts it at boot after that.
+  # after an upgrade moves its image, or when it stopped answering). Docker
+  # restarts it at boot after that.
   if $ABS_MANAGED && [[ -z $(docker_problem) ]] &&
-    [[ $(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$ABS_CONTAINER" 2>/dev/null) != "true $ABS_IMAGE" ]]; then
+    { [[ $(docker inspect -f '{{.State.Running}} {{.Config.Image}}' "$ABS_CONTAINER" 2>/dev/null) != "true $ABS_IMAGE" ]] ||
+      ! abs_wait 5; }; then
     systemd-run --user --quiet --collect --unit=omarchy-audiobook-server \
       --setenv=PATH="$PATH" -- "$SELF" server up 2>/dev/null || true
   fi
@@ -736,7 +891,7 @@ cmd_server() {
       abs_running && running=true
       jq -nc --arg url "$ABS_URL" --arg tailnet "$(abs_tailnet_url)" --arg user "$ABS_USERNAME" \
         --arg lib "$ABS_LIBRARY_DIR" --argjson running "$running" --argjson managed "$ABS_MANAGED" \
-        '{managed: $managed, running: $running, url: $url, tailnet: ($tailnet | select(. != "")),
+        '{managed: $managed, running: $running, url: $url, tailnet: (if $tailnet == "" then null else $tailnet end),
           username: $user, library: $lib}'
       ;;
     "")
@@ -778,7 +933,8 @@ case "${1:-}" in
   cancel) shift; cmd_cancel "$@" ;;
   open) shift; cmd_open "$@" ;;
   log) exec less +F "$(job_get "${2:?usage: omarchy-audiobook log <id>}" .log)" ;;
-  clear) cmd_clear ;;
+  clear) shift; cmd_clear "$@" ;;
+  retry) shift; cmd_retry "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   engine)
     [[ ${2:-} == pull ]] || die "usage: omarchy-audiobook engine pull"
@@ -798,7 +954,8 @@ case "${1:-}" in
     echo "  cancel <id>             stop a queued or running job"
     echo "  open <id>               open a finished audiobook"
     echo "  log <id>                follow a job's ebook2audiobook log"
-    echo "  clear                   forget finished jobs"
+    echo "  retry [--fresh] <id>    rerun a failed job, resuming from what it kept"
+    echo "  clear [--all]           forget finished jobs (--all: also resumable failed ones)"
     echo "  doctor [--fix]          check (and repair) Docker, GPU access and the image"
     echo "  engine pull             download the ebook2audiobook image now"
     echo "  server [info|up|down]   the plugin's Audiobookshelf; no args: how to sign in from Absorb"

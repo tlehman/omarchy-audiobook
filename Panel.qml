@@ -80,7 +80,7 @@ Panel {
     var glyph = job.state === "done" ? "󰄬" : (job.state === "failed" ? "󰀦" : "󰜺")
     var text = glyph + "  " + clip(job.title, 34)
     if (job.state === "done" && job.author) text += " — " + clip(job.author, 18)
-    if (job.state === "failed") text += " — failed"
+    if (job.state === "failed") text += job.resumable ? " — failed, click to resume" : " — failed"
     if (job.state === "cancelled") text += " — cancelled"
     return text
   }
@@ -88,6 +88,8 @@ Panel {
   function openJob(job) {
     if (job.state === "failed" && job.problem)
       root.fixSetup()
+    else if (job.state === "failed" && job.resumable)
+      root.run(["retry", job.id])
     else if (job.state === "failed")
       Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", root.cli + " log " + job.id])
     else if (job.link)

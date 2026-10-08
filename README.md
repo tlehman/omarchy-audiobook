@@ -59,6 +59,19 @@ whatever started it. Books narrate one at a time; the rest wait as
 "queued". While a job runs, the bar shows its percentage next to the icon,
 and the panel shows progress, the time left and a cancel button.
 
+A failed job keeps what it finished, so a crash late in a long book doesn't
+mean narrating it again. If the M4B is done but couldn't be filed (say
+Audiobookshelf was down), `retry` only files it. If narration stopped partway,
+`retry` continues ebook2audiobook's session from the last sentence it saved.
+Click the failed job in the panel, or the failure notification, to retry it.
+The kept files live in `~/.local/share/omarchy-audiobook/work/<id>` until
+the book is filed, the job is cancelled, or you run `clear --all`.
+
+If Audiobookshelf can't be reached when a book finishes, the book goes to
+`OUTPUT_DIR` instead of failing the job. When Docker shows the server
+container as up but it doesn't answer, which happens when its network link
+was deleted, the plugin restarts the container.
+
 ## Audiobookshelf
 
 The plugin runs Audiobookshelf 2.37.1 as the `omarchy-audiobook-abs`
@@ -120,9 +133,10 @@ omarchy-audiobook convert <file.epub>...  queue EPUBs
 omarchy-audiobook status                  JSON of jobs and the engine (what the widget polls)
 omarchy-audiobook epubs [n]               JSON of recent EPUBs
 omarchy-audiobook cancel <id>             stop a job and its container
+omarchy-audiobook retry [--fresh] <id>    rerun a failed job from what it kept (--fresh: from scratch)
 omarchy-audiobook open <id>               open a finished book
 omarchy-audiobook log <id>                follow the ebook2audiobook output
-omarchy-audiobook clear                   forget finished jobs
+omarchy-audiobook clear [--all]           forget finished jobs (--all: also failed ones that can resume)
 omarchy-audiobook doctor [--fix]          check (and repair) Docker, GPU access, the image and the server
 omarchy-audiobook engine pull             download the image now
 omarchy-audiobook server                  how to sign in (address, username)
