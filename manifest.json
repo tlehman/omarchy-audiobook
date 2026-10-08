@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omarchy-audiobook",
   "name": "omarchy-audiobook",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "Tobi Lehman",
   "license": "MIT",
   "description": "Turn EPUBs into M4B audiobooks with ebook2audiobook on the local GPU, then drop them into Audiobookshelf.",

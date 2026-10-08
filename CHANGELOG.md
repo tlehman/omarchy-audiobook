@@ -8,6 +8,8 @@ fixes bump patch. Add entries under **Unreleased**, then run
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-08
+
 - Fix: a book that finished narrating was deleted when Audiobookshelf didn't
   answer at import time. Bringing the server up could exit the runner, and
   its cleanup removed the work folder that held the M4B. A server problem now
